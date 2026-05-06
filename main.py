@@ -8,7 +8,6 @@ from dotenv import load_dotenv
 from flask import Flask, Response
 import logging
 
-# Ladowanie ustawien
 load_dotenv()
 RTSP_URL = os.getenv("CAM2_RTSP_URL")
 CAM_NAME = os.getenv("CAM2_NAME", "Brama AI")
@@ -37,15 +36,15 @@ if MQTT_USER and MQTT_PASS:
 try:
     mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
     mqtt_client.loop_start()
-    print("✅ Połączono z MQTT!")
+    print("✅ Połączono z MQTT!", flush=True)
 except Exception as e:
-    print(f"❌ Błąd MQTT: {e}")
+    print(f"❌ Błąd MQTT: {e}", flush=True)
 
 def send_mqtt_update(status):
     payload = "ON" if status == "OTWARTA" else "OFF"
     try:
         mqtt_client.publish(MQTT_TOPIC, payload, retain=True)
-        print(f"📡 Wysłano do HA: {payload}")
+        print(f"📡 Wysłano do HA: {payload}", flush=True)
     except Exception as e:
         pass
 
@@ -62,34 +61,11 @@ def get_error_frame(text="BRAK SYGNALU"):
     ret, buffer = cv2.imencode('.jpg', frame)
     return buffer.tobytes()
 
-
-def build_roi_mask(conf, w_frame, h_frame):
-    if "ROI_POINTS" in conf and isinstance(conf["ROI_POINTS"], list) and len(conf["ROI_POINTS"]):
-        pts = np.array(conf["ROI_POINTS"], dtype=np.int32)
-        pts[:, 0] = np.clip(pts[:, 0], 0, w_frame - 1)
-        pts[:, 1] = np.clip(pts[:, 1], 0, h_frame - 1)
-        mask = np.zeros((h_frame, w_frame), np.uint8)
-        cv2.fillPoly(mask, [pts], 255)
-        return mask, pts, True
-
-    rx = conf.get("ROI_X", 0)
-    ry = conf.get("ROI_Y", 0)
-    rw = conf.get("ROI_W", w_frame)
-    rh = conf.get("ROI_H", h_frame)
-    rx = max(0, min(rx, w_frame - 1))
-    ry = max(0, min(ry, h_frame - 1))
-    rw = min(rw, w_frame - rx)
-    rh = min(rh, h_frame - ry)
-    mask = np.zeros((h_frame, w_frame), np.uint8)
-    if rw > 0 and rh > 0:
-        mask[ry:ry+rh, rx:rx+rw] = 255
-    pts = np.array([[rx, ry], [rx+rw, ry], [rx+rw, ry+rh], [rx, ry+rh]], dtype=np.int32)
-    return mask, pts, False
-
 camera = cv2.VideoCapture(RTSP_URL)
 
 def generate_frames():
     global last_status, camera, status_buffer
+    frame_count = 0
     
     while True:
         if not camera.isOpened():
@@ -101,7 +77,8 @@ def generate_frames():
             time.sleep(1)
 
         conf = load_config()
-        thresh = conf.get("THRESHOLD", 1000)
+        rx, ry, rw, rh = conf["ROI_X"], conf["ROI_Y"], conf["ROI_W"], conf["ROI_H"]
+        thresh = conf["THRESHOLD"]
 
         success, frame = camera.read()
         
@@ -112,35 +89,17 @@ def generate_frames():
             camera = cv2.VideoCapture(RTSP_URL)
             continue
 
-        # Przeskalowanie do standardu 640x480
         frame = cv2.resize(frame, (640, 480))
 
         try:
             h_frame, w_frame = frame.shape[:2]
-            mask, roi_pts, is_polygon = build_roi_mask(conf, w_frame, h_frame)
-            if cv2.countNonZero(mask) == 0:
-                raise ValueError("ROI maska jest pusta")
-
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            enhanced = cv2.equalizeHist(gray)
-            blurred = cv2.GaussianBlur(enhanced, (5, 5), 0)
-
-            masked = cv2.bitwise_and(blurred, blurred, mask=mask)
-            if cv2.countNonZero(masked) > 0:
-                median_val = np.median(masked[mask > 0])
-            else:
-                median_val = np.median(blurred)
-
-            lower = int(max(10, 0.66 * median_val))
-            upper = int(min(255, 1.33 * median_val))
-            if upper <= lower:
-                lower = max(10, int(median_val * 0.5))
-                upper = max(lower + 10, int(median_val * 1.5))
-
-            edges = cv2.Canny(masked, lower, upper)
-            edges = cv2.bitwise_and(edges, mask)
+            roi = frame[ry:ry+rh, rx:rx+rw]
+            gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            
+            enhanced_roi = cv2.equalizeHist(gray_roi)
+            blurred = cv2.GaussianBlur(enhanced_roi, (3, 3), 0)
+            edges = cv2.Canny(blurred, 15, 50)
             edge_count = int(np.sum(edges > 0))
-            # ----------------------------------
 
             current_raw = "OTWARTA" if edge_count < thresh else "ZAMKNIETA"
             
@@ -159,35 +118,26 @@ def generate_frames():
                 send_mqtt_update(confirmed_status)
                 last_status = confirmed_status
 
-            color = (0, 0, 255) if confirmed_status == "OTWARTA" else (0, 255, 0)
-            
-            # Podgląd krawędzi tylko w obrębie ROI, nakładany jako mały podgląd
-            x, y, w, h = cv2.boundingRect(roi_pts)
-            if w > 0 and h > 0:
-                debug_roi = edges[y:y+h, x:x+w]
-                debug_edges = cv2.cvtColor(debug_roi, cv2.COLOR_GRAY2BGR)
-                preview_width = min(240, w)
-                preview_height = min(160, h)
-                if preview_width > 0 and preview_height > 0:
-                    preview = cv2.resize(debug_edges, (preview_width, preview_height), interpolation=cv2.INTER_AREA)
-                    frame[10:10+preview_height, 10:10+preview_width] = preview
-                    cv2.rectangle(frame, (8, 8), (12+preview_width, 12+preview_height), (255, 255, 255), 1)
-                    cv2.putText(frame, "ROI preview", (10, 10 + preview_height + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+            # --- LOGOWANIE DO KONSOLI CO OK. 1 SEKUNDE ---
+            frame_count += 1
+            if frame_count % 25 == 0:
+                timestamp = time.strftime("%H:%M:%S")
+                print(f"[{timestamp}] AI RAPORT: {confirmed_status} | Edges: {edge_count} | Prog: {thresh}", flush=True)
 
-            # Interfejs
-            if is_polygon:
-                cv2.polylines(frame, [roi_pts], True, color, 3)
-            else:
-                cv2.rectangle(frame, tuple(roi_pts[0]), tuple(roi_pts[2]), color, 3)
-            cv2.rectangle(frame, (0, h_frame-95), (w_frame, h_frame), (0,0,0), -1)
+            color = (0, 0, 255) if confirmed_status == "OTWARTA" else (0, 255, 0)
+            debug_edges = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+            dh, dw = debug_edges.shape[:2]
+            frame[0:dh, 0:dw] = debug_edges
             
-            timestamp = time.strftime("%H:%M:%S")
-            cv2.putText(frame, f"{timestamp} | {confirmed_status}", (10, h_frame-55), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-            cv2.putText(frame, f"Edges: {edge_count} (Prog: {thresh})", (10, h_frame-30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
-            cv2.putText(frame, f"Canny: {lower}/{upper}", (10, h_frame-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
+            cv2.rectangle(frame, (rx, ry), (rx+rw, ry+rh), color, 3)
+            cv2.rectangle(frame, (0, h_frame-80), (w_frame, h_frame), (0,0,0), -1)
+            
+            ts_display = time.strftime("%H:%M:%S")
+            cv2.putText(frame, f"{ts_display} | {confirmed_status}", (10, h_frame-45), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+            cv2.putText(frame, f"Edges: {edge_count} (Prog: {thresh})", (10, h_frame-15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
 
         except Exception as e:
-            print(f"Blad przetwarzania: {e}")
+            print(f"❌ Blad przetwarzania: {e}", flush=True)
             pass
 
         ret, buffer = cv2.imencode('.jpg', frame)
@@ -198,10 +148,11 @@ def generate_frames():
 def index():
     return f"""
     <html>
+        <head><title>{CAM_NAME}</title></head>
         <body style="background:#111; color:white; font-family:sans-serif; text-align:center;">
             <h1>{CAM_NAME} - AI Shield</h1>
             <img src="/video_feed" style="border: 4px solid #333; border-radius:10px; max-width:90%;">
-            <p>Status wysylany do MQTT: <b>{MQTT_TOPIC}</b></p>
+            <p>Status MQTT: <b>{MQTT_TOPIC}</b></p>
         </body>
     </html>
     """
@@ -213,4 +164,5 @@ def video_feed():
 if __name__ == "__main__":
     log = logging.getLogger('werkzeug')
     log.setLevel(logging.ERROR)
+    print(f"🚀 Startuje Flask na porcie 5000...", flush=True)
     app.run(host='0.0.0.0', port=5000, debug=False)
