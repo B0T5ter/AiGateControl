@@ -1,0 +1,13 @@
+services:
+  gate-detector:
+    build: .
+    container_name: brama_ai_core
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "5000:5000"
+    volumes:
+      - .:/app
+    environment:
+      - PYTHONUNBUFFERED=1
