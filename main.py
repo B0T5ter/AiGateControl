@@ -61,6 +61,30 @@ def get_error_frame(text="BRAK SYGNALU"):
     ret, buffer = cv2.imencode('.jpg', frame)
     return buffer.tobytes()
 
+
+def build_roi_mask(conf, w_frame, h_frame):
+    if "ROI_POINTS" in conf and isinstance(conf["ROI_POINTS"], list) and len(conf["ROI_POINTS"]) >= 3:
+        pts = np.array(conf["ROI_POINTS"], dtype=np.int32)
+        pts[:, 0] = np.clip(pts[:, 0], 0, w_frame - 1)
+        pts[:, 1] = np.clip(pts[:, 1], 0, h_frame - 1)
+        mask = np.zeros((h_frame, w_frame), np.uint8)
+        cv2.fillPoly(mask, [pts], 255)
+        return mask, pts, True
+
+    rx = int(conf.get("ROI_X", 0))
+    ry = int(conf.get("ROI_Y", 0))
+    rw = int(conf.get("ROI_W", w_frame))
+    rh = int(conf.get("ROI_H", h_frame))
+    rx = max(0, min(rx, w_frame - 1))
+    ry = max(0, min(ry, h_frame - 1))
+    rw = min(rw, w_frame - rx)
+    rh = min(rh, h_frame - ry)
+    mask = np.zeros((h_frame, w_frame), np.uint8)
+    if rw > 0 and rh > 0:
+        mask[ry:ry+rh, rx:rx+rw] = 255
+    pts = np.array([[rx, ry], [rx+rw, ry], [rx+rw, ry+rh], [rx, ry+rh]], dtype=np.int32)
+    return mask, pts, False
+
 camera = cv2.VideoCapture(RTSP_URL)
 
 def generate_frames():
@@ -77,8 +101,7 @@ def generate_frames():
             time.sleep(1)
 
         conf = load_config()
-        rx, ry, rw, rh = conf["ROI_X"], conf["ROI_Y"], conf["ROI_W"], conf["ROI_H"]
-        thresh = conf["THRESHOLD"]
+        thresh = conf.get("THRESHOLD", 1000)
 
         success, frame = camera.read()
         
@@ -93,12 +116,16 @@ def generate_frames():
 
         try:
             h_frame, w_frame = frame.shape[:2]
-            roi = frame[ry:ry+rh, rx:rx+rw]
-            gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-            
-            enhanced_roi = cv2.equalizeHist(gray_roi)
-            blurred = cv2.GaussianBlur(enhanced_roi, (3, 3), 0)
-            edges = cv2.Canny(blurred, 15, 50)
+            mask, roi_pts, is_polygon = build_roi_mask(conf, w_frame, h_frame)
+            if cv2.countNonZero(mask) == 0:
+                raise ValueError("ROI maska jest pusta")
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            enhanced = cv2.equalizeHist(gray)
+            blurred = cv2.GaussianBlur(enhanced, (3, 3), 0)
+            masked = cv2.bitwise_and(blurred, blurred, mask=mask)
+            edges = cv2.Canny(masked, 15, 50)
+            edges = cv2.bitwise_and(edges, mask)
             edge_count = int(np.sum(edges > 0))
 
             current_raw = "OTWARTA" if edge_count < thresh else "ZAMKNIETA"
@@ -125,11 +152,21 @@ def generate_frames():
                 print(f"[{timestamp}] AI RAPORT: {confirmed_status} | Edges: {edge_count} | Prog: {thresh}", flush=True)
 
             color = (0, 0, 255) if confirmed_status == "OTWARTA" else (0, 255, 0)
-            debug_edges = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
-            dh, dw = debug_edges.shape[:2]
-            frame[0:dh, 0:dw] = debug_edges
+            roi_x, roi_y, roi_w, roi_h = cv2.boundingRect(roi_pts)
+            preview = edges[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
+            preview_w = min(240, roi_w)
+            preview_h = min(160, roi_h)
+            if preview_w > 0 and preview_h > 0 and preview.size > 0:
+                preview = cv2.resize(preview, (preview_w, preview_h), interpolation=cv2.INTER_AREA)
+                preview = cv2.cvtColor(preview, cv2.COLOR_GRAY2BGR)
+                frame[10:10+preview_h, 10:10+preview_w] = preview
+                cv2.rectangle(frame, (8, 8), (12+preview_w, 12+preview_h), (255, 255, 255), 1)
+                cv2.putText(frame, "ROI preview", (10, 10 + preview_h + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
             
-            cv2.rectangle(frame, (rx, ry), (rx+rw, ry+rh), color, 3)
+            if is_polygon:
+                cv2.polylines(frame, [roi_pts], True, color, 3)
+            else:
+                cv2.rectangle(frame, tuple(roi_pts[0]), tuple(roi_pts[2]), color, 3)
             cv2.rectangle(frame, (0, h_frame-80), (w_frame, h_frame), (0,0,0), -1)
             
             ts_display = time.strftime("%H:%M:%S")
